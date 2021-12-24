@@ -35,10 +35,6 @@ func main() {
 	s.SetStyle(defStyle)
 
 	s.Clear()
-	s.SetContent(0, 0, 'H', nil, defStyle)
-	s.SetContent(1, 0, 'i', nil, defStyle)
-	s.SetContent(2, 0, '!', nil, defStyle)
-
 	s.EnableMouse()
 
 	cb := ColorBuffer{}
@@ -47,7 +43,7 @@ func main() {
 		for range time.NewTicker(time.Millisecond * 10).C {
 			points := cb.Tick()
 			for _, p := range points {
-				content := '0'
+				content := '█'
 				if p.i == 255 {
 					content = ' '
 				}
