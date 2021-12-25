@@ -2,22 +2,105 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
+	"os"
 	"sync"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/gliderlabs/ssh"
+
+	_ "embed"
 )
 
 var (
-	colorB = [3]float64{194, 229, 156}
-	colorA = [3]float64{100, 179, 244}
+	//go:embed gradients.json
+	gradientBody []byte
+	gradients    []Gradient
 )
 
-func linearGradient(x float64) (int32, int32, int32) {
+func init() {
+	os.Setenv("COLORTERM", "truecolor")
+	rand.Seed(time.Now().UnixNano())
+	if err := json.Unmarshal(gradientBody, &gradients); err != nil {
+		panic(err)
+	}
+	for i, g := range gradients {
+		for _, c := range g.Colors {
+			r, g, b := parseHexColor(c)
+			gradients[i].colors = append(gradients[i].colors, []float64{r, g, b})
+		}
+	}
+}
+
+type Gradient struct {
+	Name   string
+	Colors []string
+	colors [][]float64
+}
+
+func parseHexColor(s string) (r, g, b float64) {
+	if s[0] != '#' {
+		panic("invalid format")
+	}
+
+	hexToByte := func(b byte) byte {
+		switch {
+		case b >= '0' && b <= '9':
+			return b - '0'
+		case b >= 'a' && b <= 'f':
+			return b - 'a' + 10
+		case b >= 'A' && b <= 'F':
+			return b - 'A' + 10
+		}
+		panic("invalid format")
+	}
+
+	switch len(s) {
+	case 7:
+		r = float64(hexToByte(s[1])<<4 + hexToByte(s[2]))
+		g = float64(hexToByte(s[3])<<4 + hexToByte(s[4]))
+		b = float64(hexToByte(s[5])<<4 + hexToByte(s[6]))
+	case 4:
+		r = float64(hexToByte(s[1]) * 17)
+		g = float64(hexToByte(s[2]) * 17)
+		b = float64(hexToByte(s[3]) * 17)
+	default:
+		panic("invalid format")
+	}
+	return
+}
+
+// point provides the color of a gradient at this point on a 0-256 scale
+func (gradient Gradient) point(x int) (r, g, b int32) {
+	segments := len(gradient.colors)
+	if segments == 2 {
+		return linearGradient(
+			gradient.colors[0],
+			gradient.colors[1],
+			float64(x))
+	}
+	if segments == 3 {
+		if x > 128 {
+			return linearGradient(
+				gradient.colors[1],
+				gradient.colors[2],
+				float64((x-128)*2),
+			)
+		}
+		return linearGradient(
+			gradient.colors[0],
+			gradient.colors[1],
+			float64(x*2),
+		)
+	}
+	panic("unimplemented")
+}
+
+func linearGradient(colorA []float64, colorB []float64, x float64) (int32, int32, int32) {
 	d := x / 256
 	r := colorA[0] + d*(colorB[0]-colorA[0])
 	g := colorA[1] + d*(colorB[1]-colorA[1])
@@ -34,7 +117,11 @@ func (f Float) Start() {
 	f.cb = &ColorBuffer{}
 	f.multisetter = &ScreenMultisetter{screens: make(map[int]tcell.Screen)}
 
+	connection := 0
 	ssh.Handle(func(s ssh.Session) {
+		id := connection
+		connection++
+		fmt.Println("New connection ->", id)
 		screen, err := tcell.NewTerminfoScreenFromTty(NewSSHSessionTTYWrapper(s))
 		if err != nil {
 			fmt.Fprintln(s, err.Error())
@@ -46,7 +133,13 @@ func (f Float) Start() {
 			_ = s.Exit(1)
 			return
 		}
+		fmt.Fprintln(s, "     ......")
+		fmt.Fprintln(s, "         ......")
 		fmt.Fprintln(s, "Goodbye, thanks for floating")
+		fmt.Fprintln(s, "               ......")
+		fmt.Fprintln(s, "                   ......")
+
+		fmt.Println("Closed         ->", id)
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -66,9 +159,7 @@ func (f Float) Start() {
 					f.multisetter.SetContent(p.x, p.y, content, nil,
 						tcell.StyleDefault.Foreground(
 							tcell.NewRGBColor(
-								linearGradient(
-									float64(p.i),
-								),
+								p.g.point(p.i),
 							),
 						),
 					)
@@ -77,13 +168,19 @@ func (f Float) Start() {
 		}
 	}()
 	_ = cancel
-	log.Fatal(ssh.ListenAndServe(":2222", nil))
+	addr := ":2222"
+	go startGotty()
+
+	fmt.Println("Listening for SSH connections at", addr)
+	log.Fatal(ssh.ListenAndServe(addr, nil))
 }
 
 func (f Float) Run(screen tcell.Screen) error {
 	if err := screen.Init(); err != nil {
 		return err
 	}
+
+	color := rand.Intn(len(gradients))
 
 	// Set default text style
 	defStyle := tcell.StyleDefault.Background(tcell.ColorReset).Foreground(tcell.ColorReset)
@@ -92,6 +189,10 @@ func (f Float) Run(screen tcell.Screen) error {
 	// Clean canvas
 	screen.Clear()
 	screen.EnableMouse()
+
+	for i, c := range "https://float.maxmcd.com or 'ssh float.maxmcd.com'" {
+		screen.SetContent(i, 0, c, nil, defStyle)
+	}
 
 	// Add screen to setter queue and save id for removing later
 	id := f.multisetter.Add(screen)
@@ -112,10 +213,14 @@ func (f Float) Run(screen tcell.Screen) error {
 		case ev := <-events:
 			switch ev := ev.(type) {
 			case *tcell.EventMouse:
-				f.cb.AddPoint(ev.Position())
+				x, y := ev.Position()
+				f.cb.AddPoint(x, y, gradients[color])
 			case *tcell.EventResize:
 				screen.Sync()
 			case *tcell.EventKey:
+				if ev.Rune() == ' ' {
+					color = rand.Intn(len(gradients))
+				}
 				if ev.Key() == tcell.KeyEscape || ev.Key() == tcell.KeyCtrlC {
 					quit <- struct{}{}
 					goto END
@@ -127,9 +232,7 @@ func (f Float) Run(screen tcell.Screen) error {
 END:
 	f.multisetter.Remove(id)
 	screen.Clear()
-	fmt.Println("exiting")
 	screen.Fini() // end
-	fmt.Println("fini")
 	return nil
 }
 
@@ -174,6 +277,7 @@ type Point struct {
 	x int
 	y int
 	i int
+	g Gradient
 }
 
 type ColorBuffer struct {
@@ -187,10 +291,10 @@ func (cb *ColorBuffer) indexBuffer(i int) int {
 	return (cb.index + i) % 256
 }
 
-func (cb *ColorBuffer) AddPoint(x, y int) {
+func (cb *ColorBuffer) AddPoint(x, y int, g Gradient) {
 	cb.lock.Lock()
 	for i := 0; i < 256; i++ {
-		cb.buffers[cb.indexBuffer(i)] = append(cb.buffers[cb.indexBuffer(i)], Point{x, y, i})
+		cb.buffers[cb.indexBuffer(i)] = append(cb.buffers[cb.indexBuffer(i)], Point{x, y, i, g})
 	}
 	cb.lock.Unlock()
 }
