@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"log"
+	"math/rand"
 	"sync"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
+	"github.com/gliderlabs/ssh"
 )
 
 var (
@@ -21,70 +25,149 @@ func linearGradient(x float64) (int32, int32, int32) {
 	return int32(r), int32(g), int32(b)
 }
 
-func main() {
-	s, err := tcell.NewScreen()
-	if err != nil {
-		log.Fatalf("%+v", err)
-	}
-	if err := s.Init(); err != nil {
-		log.Fatalf("%+v", err)
+type Float struct {
+	cb          *ColorBuffer
+	multisetter *ScreenMultisetter
+}
+
+func (f Float) Start() {
+	f.cb = &ColorBuffer{}
+	f.multisetter = &ScreenMultisetter{screens: make(map[int]tcell.Screen)}
+
+	ssh.Handle(func(s ssh.Session) {
+		screen, err := tcell.NewTerminfoScreenFromTty(NewSSHSessionTTYWrapper(s))
+		if err != nil {
+			fmt.Fprintln(s, err.Error())
+			_ = s.Exit(1)
+			return
+		}
+		if err := f.Run(screen); err != nil {
+			fmt.Fprintln(s, err.Error())
+			_ = s.Exit(1)
+			return
+		}
+		fmt.Fprintln(s, "Goodbye, thanks for floating")
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		ticker := time.NewTicker(time.Millisecond * 10).C
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker:
+				points := f.cb.Tick()
+				for _, p := range points {
+					content := '█'
+					if p.i == 255 {
+						content = ' '
+					}
+					f.multisetter.SetContent(p.x, p.y, content, nil,
+						tcell.StyleDefault.Foreground(
+							tcell.NewRGBColor(
+								linearGradient(
+									float64(p.i),
+								),
+							),
+						),
+					)
+				}
+			}
+		}
+	}()
+	_ = cancel
+	log.Fatal(ssh.ListenAndServe(":2222", nil))
+}
+
+func (f Float) Run(screen tcell.Screen) error {
+	if err := screen.Init(); err != nil {
+		return err
 	}
 
 	// Set default text style
 	defStyle := tcell.StyleDefault.Background(tcell.ColorReset).Foreground(tcell.ColorReset)
-	s.SetStyle(defStyle)
+	screen.SetStyle(defStyle)
 
-	s.Clear()
-	s.EnableMouse()
+	// Clean canvas
+	screen.Clear()
+	screen.EnableMouse()
 
-	cb := ColorBuffer{}
+	// Add screen to setter queue and save id for removing later
+	id := f.multisetter.Add(screen)
 
-	go func() {
-		for range time.NewTicker(time.Millisecond * 10).C {
-			points := cb.Tick()
-			for _, p := range points {
-				content := '█'
-				if p.i == 255 {
-					content = ' '
-				}
-				s.SetContent(p.x, p.y, content, nil,
-					tcell.StyleDefault.Foreground(
-						tcell.NewRGBColor(
-							linearGradient(
-								float64(p.i),
-							),
-						),
-					),
-				)
-			}
-			s.Show()
-		}
-	}()
+	// Render at 60fps
+	ticker := time.NewTicker(time.Millisecond * 1000 / 60).C
+
+	events := make(chan tcell.Event)
+	quit := make(chan struct{})
+	go screen.ChannelEvents(events, quit)
 
 	for {
-		// Update screen
-		s.Show()
-
-		// Poll event
-		ev := s.PollEvent()
-		// Process event
-		switch ev := ev.(type) {
-		case *tcell.EventMouse:
-			x, y := ev.Position()
-			s.SetContent(x, y, 'O', nil, defStyle)
-			cb.AddPoint(x, y)
-		case *tcell.EventResize:
-			s.Sync()
-		case *tcell.EventKey:
-			if ev.Key() == tcell.KeyEscape || ev.Key() == tcell.KeyCtrlC {
-				goto END
+		// // Update screen
+		// screen.Show()
+		select {
+		case <-ticker:
+			screen.Show()
+		case ev := <-events:
+			switch ev := ev.(type) {
+			case *tcell.EventMouse:
+				f.cb.AddPoint(ev.Position())
+			case *tcell.EventResize:
+				screen.Sync()
+			case *tcell.EventKey:
+				if ev.Key() == tcell.KeyEscape || ev.Key() == tcell.KeyCtrlC {
+					quit <- struct{}{}
+					goto END
+				}
 			}
 		}
 	}
 
 END:
-	s.Clear()
-	s.Fini() // end
+	f.multisetter.Remove(id)
+	screen.Clear()
+	fmt.Println("exiting")
+	screen.Fini() // end
+	fmt.Println("fini")
+	return nil
+}
+
+type ScreenMultisetter struct {
+	screens map[int]tcell.Screen
+	lock    sync.Mutex
+}
+
+func (sm *ScreenMultisetter) Add(screen tcell.Screen) (id int) {
+	sm.lock.Lock()
+	defer sm.lock.Unlock()
+	for {
+		id = rand.Int()
+		if _, found := sm.screens[id]; !found {
+			break
+		}
+	}
+	sm.screens[id] = screen
+	return id
+}
+
+func (sm *ScreenMultisetter) SetContent(x int, y int, mainc rune, combc []rune, style tcell.Style) {
+	sm.lock.Lock()
+	defer sm.lock.Unlock()
+	for _, screen := range sm.screens {
+		screen.SetContent(x, y, mainc, combc, style)
+	}
+}
+
+func (sm *ScreenMultisetter) Remove(id int) {
+	sm.lock.Lock()
+	delete(sm.screens, id)
+	sm.lock.Unlock()
+}
+
+func main() {
+	f := Float{}
+	f.Start()
 }
 
 type Point struct {
@@ -115,7 +198,7 @@ func (cb *ColorBuffer) AddPoint(x, y int) {
 func (cb *ColorBuffer) Tick() []Point {
 	cb.lock.Lock()
 	out := cb.buffers[cb.index]
-	cb.buffers[cb.index] = nil
+	cb.buffers[cb.index] = make([]Point, 0, 256)
 	cb.index++
 	cb.index %= 256
 	cb.lock.Unlock()
