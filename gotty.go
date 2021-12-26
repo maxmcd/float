@@ -26,7 +26,7 @@ func init() {
 					goto CONTINUE
 				}
 			}
-			fmt.Fprintln(os.Stderr, line)
+			fmt.Fprintln(os.Stderr, "[gotty]: ", line)
 		CONTINUE:
 		}
 	}()
