@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"sync"
 
@@ -47,7 +46,6 @@ func (s *sshSessionTTYWrapper) Start() error {
 	if !accepted {
 		return errors.New("ssh session is not a pty")
 	}
-	fmt.Println("TERM", pty.Term)
 	s.width = pty.Window.Width
 	s.height = pty.Window.Height
 
