@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 
@@ -23,7 +24,7 @@ type sshSessionTTYWrapper struct {
 	reader *io.PipeReader
 }
 
-func NewSSHSessionTTYWrapper(s ssh.Session) *sshSessionTTYWrapper {
+func newSSHSessionTTYWrapper(s ssh.Session) *sshSessionTTYWrapper {
 	return &sshSessionTTYWrapper{session: s}
 }
 
@@ -46,6 +47,7 @@ func (s *sshSessionTTYWrapper) Start() error {
 	if !accepted {
 		return errors.New("ssh session is not a pty")
 	}
+	fmt.Println("TERM", pty.Term)
 	s.width = pty.Window.Width
 	s.height = pty.Window.Height
 
@@ -59,7 +61,10 @@ func (s *sshSessionTTYWrapper) Start() error {
 			select {
 			case <-s.ctx.Done():
 				return
-			case window := <-sizeChanges:
+			case window, ok := <-sizeChanges:
+				if !ok {
+					return
+				}
 				s.lock.Lock()
 				s.width = window.Width
 				s.height = window.Height
